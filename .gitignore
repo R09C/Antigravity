@@ -1,0 +1,33 @@
+# Non-MCP Files
+Antigravity.exe
+Antigravity.VisualElementsManifest.xml
+LICENSES.chromium.html
+chrome_100_percent.pak
+chrome_200_percent.pak
+d3dcompiler_47.dll
+dxcompiler.dll
+dxil.dll
+ffmpeg.dll
+icudtl.dat
+libEGL.dll
+libGLESv2.dll
+resources.pak
+snapshot_blob.bin
+unins000.dat
+unins000.exe
+v8_context_snapshot.bin
+vk_swiftshader.dll
+vk_swiftshader_icd.json
+vulkan-1.dll
+debug.log
+
+# Folders
+appx/
+bin/
+locales/
+resources/
+tools/
+__pycache__/
+.pytest_cache/
+tests/
+venv/
