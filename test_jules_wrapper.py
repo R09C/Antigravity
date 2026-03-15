@@ -149,6 +149,7 @@ async def test_jules_new_session_tool():
 async def test_jules_remote_new_tool():
     params = RemoteNewInput(prompt="remote prompt", repo="owner/repo", parallel=1)
     with patch("jules_wrapper._run_jules", new_callable=AsyncMock) as mock_run:
+        mock_run.return_value = "session 12345 created"
         await jules_remote_new(params)
         args, kwargs = mock_run.call_args
         cmd_args = args[0]
@@ -182,27 +183,58 @@ async def test_jules_check_status_thinking():
         assert "SESSION_ID: 123" in result
 
 @pytest.mark.asyncio
-async def test_jules_check_status_blocked_by_question():
+async def test_jules_check_status_awaiting_user_feedback():
     with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
-        mock_pull.return_value = "Please confirm? [y/N]"
+        mock_pull.return_value = "Waiting for input from the user"
         params = CheckStatusInput(session_id="123", repo="test/repo")
         result = await jules_check_status(params)
-        assert "RESULT_STATE: BLOCKED_BY_QUESTION" in result
-        assert "Please confirm? [y/N]" in result
+        assert "RESULT_STATE: AWAITING_USER_FEEDBACK" in result
 
 @pytest.mark.asyncio
-async def test_jules_check_status_completed():
+async def test_jules_check_status_awaiting_plan_approval():
     with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
-        # First call gets diff
-        # Second call (apply) gets "patch applied"
-        mock_pull.side_effect = [
-            "Here is the code\ndiff --git a/file b/file\n+ new code",
-            "patch applied successfully"
-        ]
+        mock_pull.return_value = "Here is the plan:\n1. do this\n2. do that\nProceed with this plan?"
         params = CheckStatusInput(session_id="123", repo="test/repo")
         result = await jules_check_status(params)
-        assert "RESULT_STATE: COMPLETED" in result
-        assert "PATCH_STATUS: APPLIED" in result
+        assert "RESULT_STATE: AWAITING_PLAN_APPROVAL" in result
+
+@pytest.mark.asyncio
+async def test_jules_check_status_completed_pending_confirmation():
+    with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
+        mock_pull.return_value = "diff --git a/test.py b/test.py\n--- a/test.py\n+++ b/test.py\n+ new code\ndeleted file mode 100644\ndiff --git a/del.py b/del.py\n--- a/del.py\n+++ /dev/null\n"
+
+        # apply=False -> should return PENDING_CONFIRMATION
+        params = CheckStatusInput(session_id="123", repo="test/repo", apply=False)
+        result = await jules_check_status(params)
+
+        assert "RESULT_STATE: READY" in result
+        assert "PATCH_STATUS: PENDING_CONFIRMATION" in result
+        assert "test.py" in result
+        assert "del.py" in result
+
+@pytest.mark.asyncio
+async def test_jules_check_status_completed_smart_applied():
+    with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
+        with patch("jules_wrapper._run_jules", new_callable=AsyncMock) as mock_run_jules:
+            with patch("jules_wrapper.find_git_repo", return_value="/fake/repo"):
+                with patch("os.path.exists", return_value=True):
+                    with patch("os.remove") as mock_remove:
+                        with patch("shutil.copy2") as mock_copy2:
+                            with patch("os.makedirs"):
+                                # Simulated diff output with one modification and one deletion
+                                mock_pull.return_value = "diff --git a/test.py b/test.py\n--- a/test.py\n+++ b/test.py\n+ new code\ndiff --git a/del.py b/del.py\ndeleted file mode 100644\n--- a/del.py\n+++ /dev/null\n"
+                                mock_run_jules.return_value = "teleport success"
+
+                                # apply=True -> should return SMART_APPLIED
+                                params = CheckStatusInput(session_id="123", repo="test/repo", apply=True)
+                                result = await jules_check_status(params)
+
+                                assert "RESULT_STATE: COMPLETED" in result
+                                assert "PATCH_STATUS: SMART_APPLIED" in result
+                                assert "UPDATED: test.py" in result
+                                assert "DELETED: del.py" in result
+                                mock_remove.assert_called_once_with("/fake/repo/del.py")
+                                mock_copy2.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_jules_check_status_finished_no_changes():
@@ -211,3 +243,34 @@ async def test_jules_check_status_finished_no_changes():
         params = CheckStatusInput(session_id="123", repo="test/repo")
         result = await jules_check_status(params)
         assert "RESULT_STATE: FINISHED_NO_CHANGES" in result
+
+@pytest.mark.asyncio
+async def test_jules_check_status_system_error():
+    with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
+        mock_pull.return_value = "Error: Something failed\n"
+        params = CheckStatusInput(session_id="123", repo="test/repo")
+        result = await jules_check_status(params)
+        assert "RESULT_STATE: SYSTEM_ERROR" in result
+
+@pytest.mark.asyncio
+async def test_session_cache_validation():
+    import jules_wrapper
+    jules_wrapper.SESSION_CACHE["cached_sess"] = "cached/repo"
+
+    # Try with wrong repo
+    params = PullSessionInput(session_id="cached_sess", repo="wrong/repo")
+    result = await jules_wrapper.jules_pull_session(params)
+    assert "Error: Session cached_sess is cached for repo cached/repo" in result
+
+    # Try check_status with wrong repo
+    status_params = CheckStatusInput(session_id="cached_sess", repo="wrong/repo")
+    status_result = await jules_wrapper.jules_check_status(status_params)
+    assert "Error: Session cached_sess is cached for repo cached/repo" in status_result
+
+    # Try with correct repo
+    with patch("jules_wrapper._run_jules", new_callable=AsyncMock) as mock_run:
+        mock_run.return_value = "success"
+        params_correct = PullSessionInput(session_id="cached_sess", repo="cached/repo")
+        res_correct = await jules_wrapper.jules_pull_session(params_correct)
+        assert res_correct == "success"
+        mock_run.assert_called_once()

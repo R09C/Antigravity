@@ -99,6 +99,25 @@ async def _run_jules(args: List[str], stdin_content: Optional[str] = None, timeo
 
 
 # ---------------------------------------------------------------------------
+# Session Cache
+# ---------------------------------------------------------------------------
+from typing import Dict
+import re
+
+# In-memory mapping of session_id -> repo
+SESSION_CACHE: Dict[str, str] = {}
+
+def extract_session_id(output: str) -> Optional[str]:
+    """Attempts to extract a session ID from Jules CLI output."""
+    # Common Jules session IDs often look like UUIDs or specific formats.
+    # For now, we look for 'Session ID: <id>' or 'https://jules.google.com/session/<id>'
+    match = re.search(r'session(?:/?| ID:?\s*)([a-zA-Z0-9-]+)', output, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Input models
 # ---------------------------------------------------------------------------
 
@@ -195,7 +214,15 @@ async def jules_new_session(params: NewSessionInput) -> str:
         # For now, we follow the user intent if possible, but the CLI help didn't show it.
         pass
 
-    return await _run_jules(args, stdin_content=safe_prompt, extra_env=extra_env)
+    res = await _run_jules(args, stdin_content=safe_prompt, extra_env=extra_env)
+
+    # Cache session mapping if created successfully
+    if params.repo:
+        sess_id = extract_session_id(res)
+        if sess_id:
+            SESSION_CACHE[sess_id] = params.repo
+
+    return res
 
 
 @mcp.tool(
@@ -215,7 +242,14 @@ async def jules_remote_new(params: RemoteNewInput) -> str:
     
     # Passing prompt via stdin is safest on Windows
     safe_prompt = f"{params.prompt}\n\n{ANTI_SPAM_DIRECTIVE}"
-    return await _run_jules(args, stdin_content=safe_prompt, extra_env=extra_env)
+    res = await _run_jules(args, stdin_content=safe_prompt, extra_env=extra_env)
+
+    if params.repo:
+        sess_id = extract_session_id(res)
+        if sess_id:
+            SESSION_CACHE[sess_id] = params.repo
+
+    return res
 
 
 @mcp.tool()
@@ -269,6 +303,11 @@ async def jules_list_repos() -> str:
     },
 )
 async def jules_pull_session(params: PullSessionInput) -> str:
+    # Validate against cache if present
+    cached_repo = SESSION_CACHE.get(params.session_id)
+    if cached_repo and params.repo and cached_repo != params.repo:
+        return f"Error: Session {params.session_id} is cached for repo {cached_repo}, but you requested {params.repo}. Action blocked for safety."
+
     # Use full --session flag for maximum compatibility
     args = ["remote", "pull", "--session", str(params.session_id)]
     if params.apply:
@@ -300,35 +339,72 @@ async def jules_check_status(params: CheckStatusInput) -> str:
     """
     Checks the current status of the session in an atomic, non-blocking way.
     """
+    cached_repo = SESSION_CACHE.get(params.session_id)
+    if cached_repo and params.repo and cached_repo != params.repo:
+        return f"Error: Session {params.session_id} is cached for repo {cached_repo}, but you requested {params.repo}. Action blocked for safety."
+
     session_url = f"https://jules.google.com/session/{params.session_id}"
     
     # Poll progress/diff
     res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=False))
     lower_res = res.lower()
 
-    # 1. Identify "Finished" states
+    # 1. System Error Detection
+    if "error:" in lower_res or "failed to" in lower_res or "exception:" in lower_res:
+        # Check if it looks like a real error before diff
+        progress_part = res.split("diff --git")[0]
+        if "error:" in progress_part.lower() or "failed to" in progress_part.lower() or "exception:" in progress_part.lower():
+            return f"RESULT_STATE: SYSTEM_ERROR\nSESSION_ID: {params.session_id}\n\nOUTPUT:\n{progress_part[:1000]}"
+
+    # 2. Identify "Finished" states
     is_finished = "finished" in lower_res or "completed" in lower_res
 
-    # 2. Extract strictly "interactive/question" blocks
+    progress_part = res.split("diff --git")[0]
+    progress_lower = progress_part.lower()
+
+    # 3. Extract strictly "interactive/question" blocks
+    # AWAITING_PLAN_APPROVAL
+    approval_indicators = [
+        "confirm this plan",
+        "proceed with this plan",
+        "does this plan look right",
+        "approve this plan"
+    ]
+
+    # Simple check for numbered lists which are common in plans
+    has_numbered_list = bool(re.search(r'^\s*\d+\.\s+', progress_part, re.MULTILINE))
+
+    if any(ind in progress_lower for ind in approval_indicators) or (has_numbered_list and "proceed?" in progress_lower):
+        lines = progress_part.strip().splitlines()
+        snippet = "\n".join(lines[-10:]) if lines else progress_part
+        return (
+             f"RESULT_STATE: AWAITING_PLAN_APPROVAL\n"
+             f"SESSION_ID: {params.session_id}\n"
+             f"SESSION_URL: {session_url}\n"
+             f"DETECTED_PROMPT: {snippet}\n\n"
+             f"AGENT_INSTRUCTION: Jules proposed a plan and is waiting for approval."
+         )
+
+    # AWAITING_USER_FEEDBACK
     blocked_indicators = [
         "waiting for input",
         "select an option",
         "please enter",
-        "confirm?",
         "provide feedback",
-        "interaction required"
+        "interaction required",
+        "what would you like to do"
     ]
 
-    progress_part = res.split("diff --git")[0]
+    is_blocked = any(ind in progress_lower for ind in blocked_indicators)
 
-    is_blocked = any(ind in progress_part.lower() for ind in blocked_indicators)
-
-    if is_blocked or ("?" in progress_part and not is_finished):
+    # Note: we are removing the arbitrary `?` check as requested.
+    # If the user really needs it, they can add explicit strings to `blocked_indicators`.
+    if is_blocked:
          lines = progress_part.strip().splitlines()
          question_snippet = "\n".join(lines[-3:]) if lines else progress_part
 
          return (
-             f"RESULT_STATE: BLOCKED_BY_QUESTION\n"
+             f"RESULT_STATE: AWAITING_USER_FEEDBACK\n"
              f"SESSION_ID: {params.session_id}\n"
              f"SESSION_URL: {session_url}\n"
              f"DETECTED_QUESTION: {question_snippet}\n\n"
@@ -336,20 +412,117 @@ async def jules_check_status(params: CheckStatusInput) -> str:
              f"visit the SESSION_URL using your browser tool to answer the question, or ask the user for help."
          )
 
-    # 3. Handle successful completion
+    # 4. Handle successful completion (SOTA Merge Approach)
     if "diff --git" in res:
-        if params.apply:
-            apply_res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=True))
-            if any(x in apply_res.lower() for x in ["patch applied", "applying patch", "already exists"]):
-                return f"RESULT_STATE: COMPLETED\nPATCH_STATUS: APPLIED\nSESSION_ID: {params.session_id}\n\nDETAILS:\n{apply_res}"
-            return f"RESULT_STATE: READY\nPATCH_STATUS: APPLY_FAILED\nSESSION_ID: {params.session_id}\n\nERROR:\n{apply_res}"
-        return f"RESULT_STATE: READY\nPATCH_STATUS: PENDING\nSESSION_ID: {params.session_id}\n\nDIFF_PREVIEW:\n{res[:1000]}"
+        # Extract files changed by Jules from the diff
+        diff_text = res[res.find("diff --git"):]
 
-    # 4. Handle finished without changes
+        # Files to add/modify
+        modified_files = set()
+        # Files deleted
+        deleted_files = set()
+
+        current_file = None
+        is_deleted = False
+
+        for line in diff_text.splitlines():
+            if line.startswith("diff --git a/"):
+                # "diff --git a/path/to/file b/path/to/file"
+                parts = line.split(" b/")
+                if len(parts) == 2:
+                    current_file = parts[1].strip()
+                is_deleted = False
+            elif line.startswith("deleted file mode"):
+                is_deleted = True
+            elif line.startswith("--- ") and current_file:
+                pass
+            elif line.startswith("+++ ") and current_file:
+                if is_deleted:
+                    deleted_files.add(current_file)
+                else:
+                    modified_files.add(current_file)
+
+        if not params.apply:
+            # Step 1: Tell the agent what files will be changed and wait for confirmation (apply=True)
+            files_preview = ""
+            if modified_files:
+                files_preview += "Modified/Added:\n  " + "\n  ".join(sorted(modified_files)) + "\n"
+            if deleted_files:
+                files_preview += "Deleted:\n  " + "\n  ".join(sorted(deleted_files)) + "\n"
+
+            return (
+                f"RESULT_STATE: READY\n"
+                f"PATCH_STATUS: PENDING_CONFIRMATION\n"
+                f"SESSION_ID: {params.session_id}\n\n"
+                f"FILES_TO_CHANGE:\n{files_preview}\n"
+                f"AGENT_INSTRUCTION: Call jules_check_status with apply=True to apply these exact changes. "
+                f"Here is a preview of the diff:\n{res[:1000]}"
+            )
+
+        # Step 2: Agent confirmed (apply=True). Execute Smart Update via teleport
+        import tempfile
+        import filecmp
+
+        work_dir = os.getcwd()
+        repo_path = find_git_repo(work_dir) or work_dir
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Teleport inside temp_dir to get a clean branch with applied patch
+            teleport_res = await _run_jules(["teleport", "--session", params.session_id], cwd=temp_dir)
+
+            # Check if teleport succeeded
+            if "error" in teleport_res.lower() and not "already exists" in teleport_res.lower():
+                # Fallback to standard apply if teleport fails
+                apply_res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=True))
+                if any(x in apply_res.lower() for x in ["patch applied", "applying patch", "already exists"]):
+                    return f"RESULT_STATE: COMPLETED\nPATCH_STATUS: APPLIED_VIA_FALLBACK\nSESSION_ID: {params.session_id}\n\nDETAILS:\n{apply_res}"
+                return f"RESULT_STATE: READY\nPATCH_STATUS: APPLY_FAILED\nSESSION_ID: {params.session_id}\n\nERROR:\n{apply_res}\nTELEPORT_ERROR: {teleport_res}"
+
+            # Find the repo root inside temp_dir
+            cloned_repo_path = find_git_repo(temp_dir)
+            if not cloned_repo_path:
+                subdirs = [os.path.join(temp_dir, d) for d in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, d))]
+                cloned_repo_path = subdirs[0] if subdirs else temp_dir
+
+            changed_files_report = []
+
+            # Process deletions
+            for file_rel_path in deleted_files:
+                dst_path = os.path.join(repo_path, file_rel_path)
+                if os.path.exists(dst_path):
+                    try:
+                        os.remove(dst_path)
+                        changed_files_report.append(f"DELETED: {file_rel_path}")
+                    except Exception as e:
+                        changed_files_report.append(f"ERROR_DELETING: {file_rel_path} ({e})")
+
+            # Process modifications and additions
+            for file_rel_path in modified_files:
+                src_path = os.path.join(cloned_repo_path, file_rel_path)
+                dst_path = os.path.join(repo_path, file_rel_path)
+
+                if os.path.exists(src_path):
+                    # In a true SOTA approach, we might check `git status` for uncommitted changes here.
+                    # For now, we simply copy the modified file from the teleported branch,
+                    # ensuring we only touch the exact files Jules changed, avoiding a full reset.
+                    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                    shutil.copy2(src_path, dst_path)
+                    changed_files_report.append(f"UPDATED: {file_rel_path}")
+                else:
+                    changed_files_report.append(f"MISSING_IN_TELEPORT: {file_rel_path}")
+
+            return (
+                f"RESULT_STATE: COMPLETED\n"
+                f"PATCH_STATUS: SMART_APPLIED\n"
+                f"SESSION_ID: {params.session_id}\n\n"
+                f"CHANGES_APPLIED:\n" + "\n".join(changed_files_report)
+            )
+
+    # 5. Handle finished without changes
     if is_finished and "no diff found" in lower_res:
         return f"RESULT_STATE: FINISHED_NO_CHANGES\nSESSION_ID: {params.session_id}\n\nOUTPUT:\n{res}"
 
-    # 5. Still thinking
+    # 6. Still thinking
     return f"RESULT_STATE: THINKING\nSESSION_ID: {params.session_id}\n\nOUTPUT:\n{res[:500]}"
 
 
