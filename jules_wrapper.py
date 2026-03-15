@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 JULES_BIN = r"C:\Users\Администратор\AppData\Roaming\npm\jules.cmd"
+JULES_TIMEOUT = 120
+
+mcp = FastMCP("jules-wrapper")
 
 ANTI_SPAM_DIRECTIVE = """
 IMPORTANT SYSTEM RULES:
@@ -92,9 +95,9 @@ class NewSessionInput(BaseModel):
         min_length=1,
         max_length=4000,
     )
-    repo: Optional[str] = Field(
-        default=None,
-        description="GitHub repo in owner/name format, e.g. 'torvalds/linux'. Defaults to CWD repo.",
+    repo: str = Field(
+        ...,
+        description="GitHub repo in owner/name format, e.g. 'torvalds/linux'. Required.",
     )
     parallel: Optional[int] = Field(
         default=1,
@@ -113,9 +116,9 @@ class RemoteNewInput(BaseModel):
         min_length=1,
         max_length=4000,
     )
-    repo: Optional[str] = Field(
-        default=None,
-        description="GitHub repo in owner/name format. Defaults to CWD repo.",
+    repo: str = Field(
+        ...,
+        description="GitHub repo in owner/name format. Required.",
     )
     parallel: Optional[int] = Field(
         default=1,
@@ -132,6 +135,10 @@ class PullSessionInput(BaseModel):
         ...,
         description="Session ID to pull results for",
         min_length=1,
+    )
+    repo: str = Field(
+        ...,
+        description="Repository name (e.g. 'owner/repo'). Required.",
     )
     apply: bool = Field(
         default=False,
@@ -165,8 +172,12 @@ async def jules_new_session(params: NewSessionInput) -> str:
     if params.repo:
         args += ["--repo", params.repo]
         extra_env["JULES_REPO"] = params.repo
+    
+    # Note: --parallel is not formally supported by the 'new' command but kept in model for parity
     if params.parallel and params.parallel > 1:
-        args += ["--parallel", str(params.parallel)]
+        # If Jules supports piping multiple tasks, we might need a different approach
+        # For now, we follow the user intent if possible, but the CLI help didn't show it.
+        pass
 
     return await _run_jules(args, stdin_content=safe_prompt, extra_env=extra_env)
 
@@ -176,18 +187,15 @@ async def jules_new_session(params: NewSessionInput) -> str:
     description="Create a REMOTE Jules session. Uses stdin for the prompt for better Windows compatibility.",
 )
 async def jules_remote_new(params: RemoteNewInput) -> str:
-    # Based on help: jules remote new --repo jiahao42/jules-cli --session "..."
-    # 'jules remote new' help says --session can take piped input.
-    # We use --session without a value (empty string or just omit) and pipe.
-    # Actually, if we omit --session value, some CLIs might fail. 
-    # But usually 'jules remote new --repo X' with stdin works.
     args = ["remote", "new"]
     extra_env = {}
     if params.repo:
         args += ["--repo", params.repo]
         extra_env["JULES_REPO"] = params.repo
+    
     if params.parallel and params.parallel > 1:
-        args += ["--parallel", str(params.parallel)]
+        # CLI help didn't show --parallel, removing from execution
+        pass
     
     # Passing prompt via stdin is safest on Windows
     safe_prompt = f"{params.prompt}\n\n{ANTI_SPAM_DIRECTIVE}"
@@ -245,10 +253,99 @@ async def jules_list_repos() -> str:
     },
 )
 async def jules_pull_session(params: PullSessionInput) -> str:
-    args = ["remote", "pull", "--session", params.session_id]
+    # Use full --session flag for maximum compatibility
+    args = ["remote", "pull", "--session", str(params.session_id)]
     if params.apply:
         args.append("--apply")
-    return await _run_jules(args)
+    
+    extra_env = {}
+    if params.repo:
+        extra_env["JULES_REPO"] = params.repo
+        
+    return await _run_jules(args, extra_env=extra_env)
+
+
+class WaitSessionInput(BaseModel):
+    session_id: str = Field(..., description="Session ID to wait for")
+    repo: str = Field(..., description="Repository name for this session. Required.")
+    apply: bool = Field(default=True, description="Apply patch automatically when ready")
+    max_attempts: int = Field(default=100, description="Max polling attempts")
+    interval: int = Field(default=60, description="Seconds between polls")
+
+@mcp.tool(
+    name="jules_wait_for_result",
+    description="Extended polling for Jules sessions (Marathon Mode: 100 attempts @ 60s). Structured for agent-led intervention."
+)
+async def jules_wait_for_result(params: WaitSessionInput) -> str:
+    """
+    Polls the session result for extended periods.
+    Designed for calling agents to parse and optionally intervene via browser.
+    """
+    session_url = f"https://jules.google.com/session/{params.session_id}"
+    
+    for i in range(params.max_attempts):
+        # Poll progress/diff
+        res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=False))
+        lower_res = res.lower()
+        
+        # 1. Identify "Finished" states
+        is_finished = "finished" in lower_res or "completed" in lower_res
+        
+        # 2. Extract strictly "interactive/question" blocks
+        # We look for keywords that imply the VM is waiting for STDIN
+        blocked_indicators = [
+            "waiting for input",
+            "select an option",
+            "please enter",
+            "confirm?",
+            "provide feedback",
+            "interaction required"
+        ]
+        
+        # Check if Jules is asking a question in the progress log (before the diff)
+        # We split by 'diff --git' to avoid false positives in the code itself
+        progress_part = res.split("diff --git")[0]
+        
+        # Heuristic: If it's not finished, but hasn't changed in a while or has a '?'
+        # Or specifically mentions blocked indicators
+        is_blocked = any(ind in progress_part.lower() for ind in blocked_indicators)
+        
+        # More aggressive question detection: '?' in the non-diff part usually implies a prompt
+        if is_blocked or ("?" in progress_part and not is_finished):
+             # Extract the last few lines of progress as the "Question"
+             lines = progress_part.strip().splitlines()
+             question_snippet = "\n".join(lines[-3:]) if lines else progress_part
+             
+             return (
+                 f"RESULT_STATE: BLOCKED_BY_QUESTION\n"
+                 f"SESSION_ID: {params.session_id}\n"
+                 f"SESSION_URL: {session_url}\n"
+                 f"DETECTED_QUESTION: {question_snippet}\n\n"
+                 f"AGENT_INSTRUCTION: Jules is waiting for an answer. You (the agent) can try to "
+                 f"visit the SESSION_URL using your browser tool to answer the question, or ask the user for help."
+             )
+
+        # 3. Handle successful completion
+        if "diff --git" in res:
+            if params.apply:
+                apply_res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=True))
+                # Check for success in apply output
+                if any(x in apply_res.lower() for x in ["patch applied", "applying patch", "already exists"]):
+                    return f"RESULT_STATE: COMPLETED\nPATCH_STATUS: APPLIED\nSESSION_ID: {params.session_id}\n\nDETAILS:\n{apply_res}"
+                return f"RESULT_STATE: READY\nPATCH_STATUS: APPLY_FAILED\nSESSION_ID: {params.session_id}\n\nERROR:\n{apply_res}"
+            return f"RESULT_STATE: READY\nPATCH_STATUS: PENDING\nSESSION_ID: {params.session_id}\n\nDIFF_PREVIEW:\n{res[:1000]}"
+
+        # 4. Handle finished without changes
+        if is_finished and "no diff found" in lower_res:
+            return f"RESULT_STATE: FINISHED_NO_CHANGES\nSESSION_ID: {params.session_id}\n\nOUTPUT:\n{res}"
+
+        # 5. Log progress for the calling agent
+        print(f"[POLL {i+1}/{params.max_attempts}] Session {params.session_id} still thinking...")
+        
+        # Wait and retry
+        await asyncio.sleep(params.interval)
+        
+    return f"RESULT_STATE: TIMEOUT\nSESSION_ID: {params.session_id}\nATTEMPTS: {params.max_attempts}\nLAST_OUTPUT:\n{res[:500]}"
 
 
 @mcp.tool(
@@ -262,7 +359,7 @@ async def jules_pull_session(params: PullSessionInput) -> str:
     },
 )
 async def jules_teleport(params: TeleportInput) -> str:
-    return await _run_jules(["teleport", params.session_id])
+    return await _run_jules(["teleport", "--session", params.session_id])
 
 
 @mcp.tool(

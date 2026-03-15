@@ -31,3 +31,5 @@ __pycache__/
 .pytest_cache/
 tests/
 venv/
+
+# JULES_PATCH_APPLIED_SUCCESSFULLY
