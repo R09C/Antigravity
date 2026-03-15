@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 import os
+import importlib
 from unittest.mock import AsyncMock, patch, MagicMock
 from jules_wrapper import (
     _run_jules,
@@ -18,10 +19,33 @@ from jules_wrapper import (
     RemoteNewInput,
     PullSessionInput,
     TeleportInput,
+    CheckStatusInput,
+    jules_check_status,
     JULES_BIN,
     find_git_repo,
     JULES_TIMEOUT,
 )
+
+def test_jules_bin_resolution_env_var():
+    with patch("os.getenv", return_value="/custom/env/jules"):
+        with patch("shutil.which", return_value="/usr/bin/jules"):
+            import jules_wrapper
+            importlib.reload(jules_wrapper)
+            assert jules_wrapper.JULES_BIN == "/custom/env/jules"
+
+def test_jules_bin_resolution_shutil():
+    with patch("os.getenv", return_value=None):
+        with patch("shutil.which", return_value="/usr/bin/jules"):
+            import jules_wrapper
+            importlib.reload(jules_wrapper)
+            assert jules_wrapper.JULES_BIN == "/usr/bin/jules"
+
+def test_jules_bin_resolution_fallback():
+    with patch("os.getenv", return_value=None):
+        with patch("shutil.which", return_value=None):
+            import jules_wrapper
+            importlib.reload(jules_wrapper)
+            assert jules_wrapper.JULES_BIN == "jules"
 
 @pytest.mark.asyncio
 async def test_run_jules_success():
@@ -33,6 +57,25 @@ async def test_run_jules_success():
         result = await _run_jules(["test", "arg"])
         assert result == "success output"
         mock_exec.assert_called_once()
+        # Verify default cwd behavior
+        kwargs = mock_exec.call_args[1]
+        assert "cwd" in kwargs
+
+@pytest.mark.asyncio
+async def test_run_jules_with_cwd():
+    mock_proc = AsyncMock()
+    mock_proc.communicate.return_value = (b"success output", b"")
+    mock_proc.returncode = 0
+
+    custom_cwd = "/custom/path"
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+        with patch("jules_wrapper.find_git_repo", return_value=None) as mock_find_repo:
+            result = await _run_jules(["test", "arg"], cwd=custom_cwd)
+            assert result == "success output"
+            mock_exec.assert_called_once()
+            kwargs = mock_exec.call_args[1]
+            assert kwargs["cwd"] == custom_cwd
+            mock_find_repo.assert_called_once_with(custom_cwd)
 
 @pytest.mark.asyncio
 async def test_run_jules_empty_output():
@@ -128,3 +171,43 @@ async def test_jules_auth_status_variants():
         assert "authenticated" in (await jules_auth_status()).lower()
         # jules_auth_status internally calls version, so we check that
         mock_run.assert_called_with(["version"])
+
+@pytest.mark.asyncio
+async def test_jules_check_status_thinking():
+    with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
+        mock_pull.return_value = "Some log output without diff or finish"
+        params = CheckStatusInput(session_id="123", repo="test/repo")
+        result = await jules_check_status(params)
+        assert "RESULT_STATE: THINKING" in result
+        assert "SESSION_ID: 123" in result
+
+@pytest.mark.asyncio
+async def test_jules_check_status_blocked_by_question():
+    with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
+        mock_pull.return_value = "Please confirm? [y/N]"
+        params = CheckStatusInput(session_id="123", repo="test/repo")
+        result = await jules_check_status(params)
+        assert "RESULT_STATE: BLOCKED_BY_QUESTION" in result
+        assert "Please confirm? [y/N]" in result
+
+@pytest.mark.asyncio
+async def test_jules_check_status_completed():
+    with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
+        # First call gets diff
+        # Second call (apply) gets "patch applied"
+        mock_pull.side_effect = [
+            "Here is the code\ndiff --git a/file b/file\n+ new code",
+            "patch applied successfully"
+        ]
+        params = CheckStatusInput(session_id="123", repo="test/repo")
+        result = await jules_check_status(params)
+        assert "RESULT_STATE: COMPLETED" in result
+        assert "PATCH_STATUS: APPLIED" in result
+
+@pytest.mark.asyncio
+async def test_jules_check_status_finished_no_changes():
+    with patch("jules_wrapper.jules_pull_session", new_callable=AsyncMock) as mock_pull:
+        mock_pull.return_value = "Job finished. No diff found."
+        params = CheckStatusInput(session_id="123", repo="test/repo")
+        result = await jules_check_status(params)
+        assert "RESULT_STATE: FINISHED_NO_CHANGES" in result

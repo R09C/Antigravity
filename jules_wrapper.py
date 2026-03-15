@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import shutil
 from typing import Optional, List
 from enum import Enum
 
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-JULES_BIN = r"C:\Users\Администратор\AppData\Roaming\npm\jules.cmd"
+JULES_BIN = os.getenv("JULES_BIN_PATH") or shutil.which("jules") or "jules"
 JULES_TIMEOUT = 120
 
 mcp = FastMCP("jules-wrapper")
@@ -36,7 +37,7 @@ def find_git_repo(path: str) -> Optional[str]:
     return None
 
 
-async def _run_jules(args: List[str], stdin_content: Optional[str] = None, timeout: Optional[int] = None, extra_env: Optional[dict] = None) -> str:
+async def _run_jules(args: List[str], stdin_content: Optional[str] = None, timeout: Optional[int] = None, extra_env: Optional[dict] = None, cwd: Optional[str] = None) -> str:
     timeout = timeout or JULES_TIMEOUT
     input_bytes = stdin_content.encode("utf-8") if stdin_content else None
     
@@ -44,13 +45,14 @@ async def _run_jules(args: List[str], stdin_content: Optional[str] = None, timeo
     if extra_env:
         env.update(extra_env)
 
-    # Auto-discovery: if JULES_REPO is not set, try to find it from CWD
+    run_cwd = cwd or os.getcwd()
+
+    # Auto-discovery: if JULES_REPO is not set, try to find it from run_cwd
     if not env.get("JULES_REPO"):
-        repo_path = find_git_repo(os.getcwd())
+        repo_path = find_git_repo(run_cwd)
         if repo_path:
             env["JULES_REPO"] = repo_path
 
-    # On Windows, we need to be careful with long argument lists
     # Using stdin for prompts is much safer than flags
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -59,6 +61,7 @@ async def _run_jules(args: List[str], stdin_content: Optional[str] = None, timeo
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=run_cwd,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=input_bytes), 
@@ -265,87 +268,77 @@ async def jules_pull_session(params: PullSessionInput) -> str:
     return await _run_jules(args, extra_env=extra_env)
 
 
-class WaitSessionInput(BaseModel):
-    session_id: str = Field(..., description="Session ID to wait for")
+class CheckStatusInput(BaseModel):
+    session_id: str = Field(..., description="Session ID to check status for")
     repo: str = Field(..., description="Repository name for this session. Required.")
     apply: bool = Field(default=True, description="Apply patch automatically when ready")
-    max_attempts: int = Field(default=100, description="Max polling attempts")
-    interval: int = Field(default=60, description="Seconds between polls")
 
 @mcp.tool(
-    name="jules_wait_for_result",
-    description="Extended polling for Jules sessions (Marathon Mode: 100 attempts @ 60s). Structured for agent-led intervention."
+    name="jules_check_status",
+    description=(
+        "Atomic, non-blocking check for Jules session status. "
+        "Returns the current state: THINKING, BLOCKED_BY_QUESTION, COMPLETED, READY, FINISHED_NO_CHANGES. "
+        "IMPORTANT SYSTEM INSTRUCTION FOR AGENT: "
+        "If the status is THINKING, you MUST NOT hang or block. Complete this tool call immediately, "
+        "and schedule your own polling by calling this tool again after a short delay (e.g., 20-30 seconds). "
+        "Do not wait inside a single tool call."
+    )
 )
-async def jules_wait_for_result(params: WaitSessionInput) -> str:
+async def jules_check_status(params: CheckStatusInput) -> str:
     """
-    Polls the session result for extended periods.
-    Designed for calling agents to parse and optionally intervene via browser.
+    Checks the current status of the session in an atomic, non-blocking way.
     """
     session_url = f"https://jules.google.com/session/{params.session_id}"
     
-    for i in range(params.max_attempts):
-        # Poll progress/diff
-        res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=False))
-        lower_res = res.lower()
-        
-        # 1. Identify "Finished" states
-        is_finished = "finished" in lower_res or "completed" in lower_res
-        
-        # 2. Extract strictly "interactive/question" blocks
-        # We look for keywords that imply the VM is waiting for STDIN
-        blocked_indicators = [
-            "waiting for input",
-            "select an option",
-            "please enter",
-            "confirm?",
-            "provide feedback",
-            "interaction required"
-        ]
-        
-        # Check if Jules is asking a question in the progress log (before the diff)
-        # We split by 'diff --git' to avoid false positives in the code itself
-        progress_part = res.split("diff --git")[0]
-        
-        # Heuristic: If it's not finished, but hasn't changed in a while or has a '?'
-        # Or specifically mentions blocked indicators
-        is_blocked = any(ind in progress_part.lower() for ind in blocked_indicators)
-        
-        # More aggressive question detection: '?' in the non-diff part usually implies a prompt
-        if is_blocked or ("?" in progress_part and not is_finished):
-             # Extract the last few lines of progress as the "Question"
-             lines = progress_part.strip().splitlines()
-             question_snippet = "\n".join(lines[-3:]) if lines else progress_part
-             
-             return (
-                 f"RESULT_STATE: BLOCKED_BY_QUESTION\n"
-                 f"SESSION_ID: {params.session_id}\n"
-                 f"SESSION_URL: {session_url}\n"
-                 f"DETECTED_QUESTION: {question_snippet}\n\n"
-                 f"AGENT_INSTRUCTION: Jules is waiting for an answer. You (the agent) can try to "
-                 f"visit the SESSION_URL using your browser tool to answer the question, or ask the user for help."
-             )
+    # Poll progress/diff
+    res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=False))
+    lower_res = res.lower()
 
-        # 3. Handle successful completion
-        if "diff --git" in res:
-            if params.apply:
-                apply_res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=True))
-                # Check for success in apply output
-                if any(x in apply_res.lower() for x in ["patch applied", "applying patch", "already exists"]):
-                    return f"RESULT_STATE: COMPLETED\nPATCH_STATUS: APPLIED\nSESSION_ID: {params.session_id}\n\nDETAILS:\n{apply_res}"
-                return f"RESULT_STATE: READY\nPATCH_STATUS: APPLY_FAILED\nSESSION_ID: {params.session_id}\n\nERROR:\n{apply_res}"
-            return f"RESULT_STATE: READY\nPATCH_STATUS: PENDING\nSESSION_ID: {params.session_id}\n\nDIFF_PREVIEW:\n{res[:1000]}"
+    # 1. Identify "Finished" states
+    is_finished = "finished" in lower_res or "completed" in lower_res
 
-        # 4. Handle finished without changes
-        if is_finished and "no diff found" in lower_res:
-            return f"RESULT_STATE: FINISHED_NO_CHANGES\nSESSION_ID: {params.session_id}\n\nOUTPUT:\n{res}"
+    # 2. Extract strictly "interactive/question" blocks
+    blocked_indicators = [
+        "waiting for input",
+        "select an option",
+        "please enter",
+        "confirm?",
+        "provide feedback",
+        "interaction required"
+    ]
 
-        # 5. Log progress for the calling agent
-        print(f"[POLL {i+1}/{params.max_attempts}] Session {params.session_id} still thinking...")
-        
-        # Wait and retry
-        await asyncio.sleep(params.interval)
-        
-    return f"RESULT_STATE: TIMEOUT\nSESSION_ID: {params.session_id}\nATTEMPTS: {params.max_attempts}\nLAST_OUTPUT:\n{res[:500]}"
+    progress_part = res.split("diff --git")[0]
+
+    is_blocked = any(ind in progress_part.lower() for ind in blocked_indicators)
+
+    if is_blocked or ("?" in progress_part and not is_finished):
+         lines = progress_part.strip().splitlines()
+         question_snippet = "\n".join(lines[-3:]) if lines else progress_part
+
+         return (
+             f"RESULT_STATE: BLOCKED_BY_QUESTION\n"
+             f"SESSION_ID: {params.session_id}\n"
+             f"SESSION_URL: {session_url}\n"
+             f"DETECTED_QUESTION: {question_snippet}\n\n"
+             f"AGENT_INSTRUCTION: Jules is waiting for an answer. You (the agent) can try to "
+             f"visit the SESSION_URL using your browser tool to answer the question, or ask the user for help."
+         )
+
+    # 3. Handle successful completion
+    if "diff --git" in res:
+        if params.apply:
+            apply_res = await jules_pull_session(PullSessionInput(session_id=params.session_id, repo=params.repo, apply=True))
+            if any(x in apply_res.lower() for x in ["patch applied", "applying patch", "already exists"]):
+                return f"RESULT_STATE: COMPLETED\nPATCH_STATUS: APPLIED\nSESSION_ID: {params.session_id}\n\nDETAILS:\n{apply_res}"
+            return f"RESULT_STATE: READY\nPATCH_STATUS: APPLY_FAILED\nSESSION_ID: {params.session_id}\n\nERROR:\n{apply_res}"
+        return f"RESULT_STATE: READY\nPATCH_STATUS: PENDING\nSESSION_ID: {params.session_id}\n\nDIFF_PREVIEW:\n{res[:1000]}"
+
+    # 4. Handle finished without changes
+    if is_finished and "no diff found" in lower_res:
+        return f"RESULT_STATE: FINISHED_NO_CHANGES\nSESSION_ID: {params.session_id}\n\nOUTPUT:\n{res}"
+
+    # 5. Still thinking
+    return f"RESULT_STATE: THINKING\nSESSION_ID: {params.session_id}\n\nOUTPUT:\n{res[:500]}"
 
 
 @mcp.tool(
