@@ -12,10 +12,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-JULES_BIN = os.getenv("JULES_BIN_PATH") or shutil.which("jules") or "jules"
+CLI_NAME = "jules.cmd" if sys.platform == "win32" else "jules"
+JULES_BIN = os.getenv("JULES_BIN_PATH") or shutil.which(CLI_NAME) or CLI_NAME
 JULES_TIMEOUT = 120
 
 mcp = FastMCP("jules-wrapper")
+
+@mcp.tool(name="agent_sleep")
+async def agent_sleep(seconds: int = 30) -> str:
+    """
+    Use this tool to pause execution when Jules status is THINKING. 
+    This allows you to wait asynchronously without timing out. 
+    Immediately call jules_check_status after this tool returns.
+    """
+    # Cap sleep to 60s to avoid IDE timeouts
+    sleep_time = min(seconds, 60)
+    await asyncio.sleep(sleep_time)
+    return f"Slept for {sleep_time} seconds. You must now call jules_check_status to continue polling."
 
 ANTI_SPAM_DIRECTIVE = """
 IMPORTANT SYSTEM RULES:
@@ -279,9 +292,8 @@ class CheckStatusInput(BaseModel):
         "Atomic, non-blocking check for Jules session status. "
         "Returns the current state: THINKING, BLOCKED_BY_QUESTION, COMPLETED, READY, FINISHED_NO_CHANGES. "
         "IMPORTANT SYSTEM INSTRUCTION FOR AGENT: "
-        "If the status is THINKING, you MUST NOT hang or block. Complete this tool call immediately, "
-        "and schedule your own polling by calling this tool again after a short delay (e.g., 20-30 seconds). "
-        "Do not wait inside a single tool call."
+        "If the status is THINKING, you MUST NOT hang or block. You MUST NOT output a final message to the user. "
+        "Instead, immediately call the agent_sleep tool, and then check the status again, creating an autonomous loop until the task is COMPLETED."
     )
 )
 async def jules_check_status(params: CheckStatusInput) -> str:
